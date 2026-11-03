@@ -1,0 +1,170 @@
+# Builds a Linux AppImage on GitHub's servers from the source zip attached to a release.
+# Same dependencies and flags as the repo's release-binaries workflow, linux-x86_64-pgo job.
+name: Build AppImage
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag of the release holding the -source.zip
+        type: string
+        default: zendnevs-v2.0.2
+
+permissions:
+  contents: read
+
+env:
+  LLVM_VERSION: '23'
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 1500M
+
+jobs:
+  appimage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Download source from the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*-source.zip' --output source.zip
+          unzip -q source.zip -d unpacked
+          mv unpacked/* source
+          rm source.zip
+          # The zip has no git history; some build steps expect a repository.
+          cd source
+          git init -q
+          git add -A
+          git -c user.name=build -c user.email=build@localhost commit -qm "$TAG"
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf cmake g++ gcc git glslang-tools libglu1-mesa-dev \
+            libpulse-dev libtool libudev-dev libxkbcommon-x11-0 \
+            mesa-common-dev nasm ninja-build qt6-base-private-dev \
+            qt6-charts-dev qt6-tools-dev libavfilter-dev libavcodec-dev \
+            libswscale-dev pkg-config zlib1g-dev libva-dev libvdpau-dev \
+            spirv-tools spirv-headers libusb-1.0-0-dev \
+            libboost-dev libboost-fiber-dev libboost-context-dev \
+            libopus-dev libasound2-dev ccache \
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: linux
+          target: desktop
+          arch: linux_gcc_64
+          modules: qtcharts
+          cache: true
+
+      - name: Install clang and the PGO profile
+        run: |
+          set -euo pipefail
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key |
+            sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-$LLVM_VERSION main" |
+            sudo tee /etc/apt/sources.list.d/llvm.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "clang-$LLVM_VERSION" "lld-$LLVM_VERSION"
+          curl -fsSL -o source/eden.profdata \
+            https://github.com/Eden-CI/PGO/releases/latest/download/eden.profdata
+          test -s source/eden.profdata
+
+      # Kept between runs, so a retry after an error only recompiles what changed.
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-${{ github.run_id }}
+          restore-keys: ccache-
+
+      - name: Configure
+        run: |
+          set -euo pipefail
+          cd source
+          profile="-fprofile-use=$PWD/eden.profdata -Wno-backend-plugin -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date"
+          cmake -S . -B build/release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DYUZU_TESTS=OFF \
+            -DYUZU_CMD=ON \
+            -DYUZU_ROOM=OFF \
+            -DYUZU_ROOM_STANDALONE=OFF \
+            -DYUZU_USE_BUNDLED_QT=OFF \
+            "-DCMAKE_PREFIX_PATH=$QT_ROOT_DIR" \
+            -DYUZU_USE_BUNDLED_SDL3=ON \
+            -DVulkanHeaders_FORCE_BUNDLED=ON \
+            -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
+            -DENABLE_UPDATE_CHECKER=OFF \
+            -DUSE_DISCORD_PRESENCE=OFF \
+            -DUSE_CCACHE=ON \
+            "-DCMAKE_C_COMPILER=clang-$LLVM_VERSION" \
+            "-DCMAKE_CXX_COMPILER=clang++-$LLVM_VERSION" \
+            "-DCMAKE_EXE_LINKER_FLAGS=-B/usr/lib/llvm-$LLVM_VERSION/bin -fuse-ld=lld" \
+            "-DCMAKE_C_FLAGS=$profile" \
+            "-DCMAKE_CXX_FLAGS=$profile"
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          cd source
+          cmake --build build/release --target yuzu yuzu-cmd --parallel
+          ccache --show-stats
+
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-${{ github.run_id }}
+
+      - name: Package AppImage
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          cd source
+          test -x build/release/bin/eglantine
+          test -x build/release/bin/eden-cli
+          tools="$RUNNER_TEMP/linuxdeploy"
+          mkdir -p "$tools"
+          curl -fsSL -o "$tools/linuxdeploy-x86_64.AppImage" \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          curl -fsSL -o "$tools/linuxdeploy-plugin-qt-x86_64.AppImage" \
+            https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+          chmod +x "$tools"/*.AppImage
+          # The desktop file names its icon dev.eglantine.eglantine.
+          icon="$RUNNER_TEMP/dev.eglantine.eglantine.png"
+          cp dist/Eglantine.png "$icon"
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          export QMAKE="$QT_ROOT_DIR/bin/qmake"
+          export LDAI_OUTPUT="Eglantine-ZendNevs-${TAG#zendnevs-}-x86_64.AppImage"
+          export OUTPUT="$LDAI_OUTPUT"
+          "$tools/linuxdeploy-x86_64.AppImage" --appdir AppDir \
+            --executable build/release/bin/eglantine \
+            --executable build/release/bin/eden-cli \
+            --desktop-file dist/dev.eden_emu.eden.desktop \
+            --icon-file "$icon" \
+            --plugin qt \
+            --output appimage
+          test -s "$LDAI_OUTPUT"
+          mv "$LDAI_OUTPUT" "$GITHUB_WORKSPACE/"
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: Eglantine-AppImage
+          path: '*.AppImage'
+          if-no-files-found: error
+          compression-level: 0
